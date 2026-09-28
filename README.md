@@ -13,7 +13,7 @@ The CLI can also send a small input directory with each job.
   60 seconds without a heartbeat, its running job becomes `lost`.
 - **Claim:** The coordinator assigns a job in one SQLite transaction so two workers
   cannot claim it. Jobs move through `queued`, `assigned`, `running`, then
-  `succeeded`, `failed`, or `lost`.
+  `succeeded`, `failed`, `cancelled`, or `lost`.
 - **Execution:** Workers initiate all connections. Jobs run without a shell, in a
   per-job directory. The assigned GPU is selected with `CUDA_VISIBLE_DEVICES`.
 - **Trust:** Every member uses the same token in this first version. Commands are
@@ -35,8 +35,22 @@ If the upload is interrupted, the CLI prints the job ID. Resume it with
 is complete. Restart both coordinator and workers after upgrading from Stage 1.
 
 The requested executable and its dependencies must still be installed on the
-worker. Jobs are not isolated, resource limits are not enforced, lost jobs are not
-retried, and a worker runs only one job at a time.
+worker. Jobs are not isolated, CPU/RAM/GPU memory limits are not enforced, lost
+jobs are not retried, and a worker runs only one job at a time.
+
+## Stage 3: job control
+
+Use `gather cancel JOB_ID` to remove a queued job or ask a worker to stop a running
+one. A running job briefly shows `cancelling`, then `cancelled` when the worker has
+stopped its process tree. Submit with `--max-runtime SECONDS` to cancel a job that
+runs too long; the timer starts when execution begins. A value of 0 means no limit.
+If a worker cannot be reached, `cancelling` does not confirm its process has
+stopped; the job becomes `lost` when the worker heartbeat expires.
+
+Press Ctrl+C once in a worker terminal to let its current job finish and then take
+the worker offline. To stop that job immediately, run `gather cancel JOB_ID` in
+another terminal. Restart the coordinator and workers after upgrading; older
+workers do not accept jobs from the Stage 3 coordinator.
 
 ## Install
 
@@ -84,6 +98,13 @@ gather jobs
 gather status JOB_ID
 gather logs JOB_ID --follow
 gather results JOB_ID --dir downloaded
+```
+
+For a time limit or manual cancellation:
+
+```powershell
+gather submit --max-runtime 300 -- python -c "import time; time.sleep(600)"
+gather cancel JOB_ID
 ```
 
 To submit a directory containing `train.py`, run:

@@ -48,7 +48,8 @@ def initialize():
                 outputs TEXT NOT NULL, has_input INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL, worker_id TEXT,
                 worker_session TEXT, gpu_uuid TEXT, exit_code INTEGER,
-                error TEXT, created REAL NOT NULL, updated REAL NOT NULL
+                error TEXT, max_runtime_s INTEGER NOT NULL DEFAULT 0,
+                started_at REAL, created REAL NOT NULL, updated REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS logs (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
@@ -56,8 +57,13 @@ def initialize():
             );
             CREATE INDEX IF NOT EXISTS logs_job ON logs(job_id, seq);
         """)
-        if "has_input" not in {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}:
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
+        if "has_input" not in columns:
             db.execute("ALTER TABLE jobs ADD COLUMN has_input INTEGER NOT NULL DEFAULT 0")
+        if "max_runtime_s" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN max_runtime_s INTEGER NOT NULL DEFAULT 0")
+        if "started_at" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN started_at REAL")
     DATA.mkdir(parents=True, exist_ok=True)
 
 
@@ -91,7 +97,7 @@ def assigned(db, job_id, request):
         raise HTTPException(404, "Job not found")
     if (job["worker_id"] != request.headers.get("X-Worker-Id") or
             job["worker_session"] != request.headers.get("X-Worker-Session") or
-            job["state"] not in ("assigned", "running")):
+            job["state"] not in ("assigned", "running", "cancelling")):
         raise HTTPException(409, "Job is not assigned to this worker session")
     return job
 
@@ -101,9 +107,12 @@ def expire_workers():
     with connection() as db:
         db.execute("""
             UPDATE jobs SET state='lost', error='Worker heartbeat expired', updated=?
-            WHERE state IN ('assigned','running') AND worker_id IN
+            WHERE state IN ('assigned','running','cancelling') AND worker_id IN
                 (SELECT id FROM workers WHERE last_seen < ?)
         """, (now, now - OFFLINE_AFTER))
+        db.execute("""UPDATE jobs SET state='cancelling', error='Runtime limit exceeded', updated=?
+            WHERE state='running' AND max_runtime_s>0 AND started_at+max_runtime_s<=?""",
+            (now, now))
 
 
 @asynccontextmanager
@@ -125,7 +134,7 @@ app = FastAPI(title="Gather", lifespan=lifespan)
 
 @app.get("/capabilities", dependencies=[Depends(authenticate)])
 def capabilities():
-    return {"input_bundle": True}
+    return {"input_bundle": True, "job_control": True}
 
 
 class Registration(BaseModel):
@@ -142,6 +151,11 @@ class JobSpec(BaseModel):
     gpu_mb: int = Field(default=1, ge=0)
     outputs: list[str] = Field(default_factory=list)
     has_input: bool = False
+    max_runtime_s: int = Field(default=0, ge=0)
+
+
+class CancelSpec(BaseModel):
+    reason: str | None = None
 
 
 @app.post("/workers/register", dependencies=[Depends(authenticate)])
@@ -151,7 +165,8 @@ def register(worker: Registration):
         old = db.execute("SELECT session FROM workers WHERE id=?", (worker.id,)).fetchone()
         if old and old["session"] != worker.session:
             db.execute("""UPDATE jobs SET state='lost', error='Worker restarted', updated=?
-                          WHERE worker_id=? AND state IN ('assigned','running')""", (now, worker.id))
+                          WHERE worker_id=? AND state IN ('assigned','running','cancelling')""",
+                       (now, worker.id))
         db.execute("""INSERT INTO workers VALUES (?,?,?,?,?)
                       ON CONFLICT(id) DO UPDATE SET name=excluded.name, session=excluded.session,
                       resources=excluded.resources, last_seen=excluded.last_seen""",
@@ -166,6 +181,19 @@ def heartbeat(worker_id: str, worker: Registration):
             WHERE id=? AND session=?""", (json.dumps(worker.resources), time.time(), worker_id, worker.session))
         if not changed.rowcount:
             raise HTTPException(409, "Worker session changed")
+    return {"ok": True}
+
+
+@app.post("/workers/{worker_id}/stop", dependencies=[Depends(authenticate)])
+def stop_worker(worker_id: str, request: Request):
+    with connection() as db:
+        changed = db.execute("UPDATE workers SET last_seen=0, session='' WHERE id=? AND session=?",
+                             (worker_id, request.headers.get("X-Worker-Session")))
+        if not changed.rowcount:
+            raise HTTPException(409, "Worker session changed")
+        db.execute("""UPDATE jobs SET state='lost', error='Worker stopped', updated=?
+            WHERE worker_id=? AND state IN ('assigned','running','cancelling')""",
+            (time.time(), worker_id))
     return {"ok": True}
 
 
@@ -187,10 +215,10 @@ def submit(spec: JobSpec):
     now = time.time()
     with connection() as db:
         db.execute("""INSERT INTO jobs
-            (id,command,cpu,ram_mb,gpu_mb,outputs,has_input,state,created,updated)
-            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (id,command,cpu,ram_mb,gpu_mb,outputs,has_input,max_runtime_s,state,created,updated)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (job_id, json.dumps(spec.command), spec.cpu, spec.ram_mb, spec.gpu_mb,
-             json.dumps(spec.outputs), int(spec.has_input),
+             json.dumps(spec.outputs), int(spec.has_input), spec.max_runtime_s,
              "uploading" if spec.has_input else "queued", now, now))
     return {"id": job_id, "state": "uploading" if spec.has_input else "queued"}
 
@@ -259,6 +287,26 @@ def job(job_id: str):
     return row_job(row)
 
 
+@app.post("/jobs/{job_id}/cancel", dependencies=[Depends(authenticate)])
+def cancel(job_id: str, spec: CancelSpec):
+    with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not current:
+            raise HTTPException(404, "Job not found")
+        state = current["state"]
+        reason = (spec.reason or "Cancelled by member")[:200]
+        if state in ("uploading", "queued", "assigned"):
+            state = "cancelled"
+        elif state == "running":
+            state = "cancelling"
+        else:
+            return {"state": state}
+        db.execute("UPDATE jobs SET state=?, error=?, updated=? WHERE id=?",
+                   (state, reason, time.time(), job_id))
+    return {"state": state}
+
+
 @app.post("/workers/{worker_id}/claim", dependencies=[Depends(authenticate)])
 def claim(worker_id: str, request: Request):
     session = request.headers.get("X-Worker-Session")
@@ -268,15 +316,15 @@ def claim(worker_id: str, request: Request):
         if not worker or worker["last_seen"] < time.time() - OFFLINE_AFTER:
             raise HTTPException(409, "Worker is not registered or heartbeat expired")
         busy = db.execute("""SELECT * FROM jobs WHERE worker_id=?
-            AND state IN ('assigned','running')""", (worker_id,)).fetchone()
+            AND state IN ('assigned','running','cancelling')""", (worker_id,)).fetchone()
         if busy:
             # A lost claim response must not strand an assigned job.
             return {"job": row_job(busy) if busy["state"] == "assigned" and
                     busy["worker_session"] == session else None}
         resources = json.loads(worker["resources"])
+        if resources.get("protocol", 1) < 3:
+            return {"job": None}
         for candidate in db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created, id"):
-            if candidate["has_input"] and resources.get("protocol", 1) < 2:
-                continue
             if candidate["cpu"] > resources.get("cpu", 0) or candidate["ram_mb"] > resources.get("ram_mb", 0):
                 continue
             gpu = None
@@ -295,8 +343,14 @@ def claim(worker_id: str, request: Request):
 @app.post("/jobs/{job_id}/start", dependencies=[Depends(authenticate)])
 def start(job_id: str, request: Request):
     with connection() as db:
-        assigned(db, job_id, request)
-        db.execute("UPDATE jobs SET state='running', updated=? WHERE id=?", (time.time(), job_id))
+        db.execute("BEGIN IMMEDIATE")
+        current = assigned(db, job_id, request)
+        if current["state"] == "cancelling":
+            raise HTTPException(409, "Job was cancelled")
+        if current["state"] == "assigned":
+            now = time.time()
+            db.execute("UPDATE jobs SET state='running', started_at=?, updated=? WHERE id=?",
+                       (now, now, job_id))
     return {"ok": True}
 
 
@@ -357,8 +411,10 @@ async def finish(job_id: str, request: Request):
     if not isinstance(exit_code, int):
         raise HTTPException(400, "exit_code must be an integer")
     with connection() as db:
-        assigned(db, job_id, request)
+        db.execute("BEGIN IMMEDIATE")
+        current = assigned(db, job_id, request)
+        cancelled = current["state"] == "cancelling" or result.get("cancelled") is True
+        state = "cancelled" if cancelled else "succeeded" if exit_code == 0 else "failed"
         db.execute("""UPDATE jobs SET state=?, exit_code=?, error=?, updated=? WHERE id=?""",
-                   ("succeeded" if exit_code == 0 else "failed", exit_code,
-                    result.get("error"), time.time(), job_id))
+                   (state, exit_code, result.get("error") or current["error"], time.time(), job_id))
     return {"ok": True}

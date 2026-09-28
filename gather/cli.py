@@ -11,7 +11,7 @@ from gather.bundle import pack_directory
 from gather.http import call
 
 
-DONE = {"succeeded", "failed", "lost"}
+DONE = {"succeeded", "failed", "lost", "cancelled"}
 
 
 def main():
@@ -24,7 +24,11 @@ def main():
     submit.add_argument("--gpu-mb", type=int, default=1, help="Minimum free GPU memory; 0 for CPU only")
     submit.add_argument("--output", action="append", default=[], help="Relative output file to retrieve")
     submit.add_argument("--input", type=Path, help="Small directory to copy into the job workspace")
+    submit.add_argument("--max-runtime", type=int, default=0, metavar="SECONDS",
+                        help="Cancel the job after this many seconds (0 means no limit)")
     submit.add_argument("command", nargs=argparse.REMAINDER)
+    cancel = commands.add_parser("cancel", help="Cancel a queued or running job")
+    cancel.add_argument("id")
     upload = commands.add_parser("upload", help="Resume an interrupted input upload")
     upload.add_argument("id")
     upload.add_argument("directory", type=Path)
@@ -51,9 +55,12 @@ def main():
             archive = pack_directory(args.input) if args.input else None
             if archive is not None and not api("GET", "/capabilities").get("input_bundle"):
                 raise RuntimeError("Coordinator does not support input bundles")
+            if args.max_runtime and not api("GET", "/capabilities").get("job_control"):
+                raise RuntimeError("Coordinator does not support runtime limits")
             job = api("POST", "/jobs", {"command": command, "cpu": args.cpu,
                                         "ram_mb": args.ram_mb, "gpu_mb": args.gpu_mb,
-                                        "outputs": args.output, "has_input": archive is not None})
+                                        "outputs": args.output, "has_input": archive is not None,
+                                        "max_runtime_s": args.max_runtime})
             if archive is not None:
                 try:
                     api("PUT", f"/jobs/{job['id']}/input", archive, raw=True, timeout=300)
@@ -65,6 +72,8 @@ def main():
             archive = pack_directory(args.directory)
             api("PUT", f"/jobs/{args.id}/input", archive, raw=True, timeout=300)
             print(args.id)
+        elif args.action == "cancel":
+            print(api("POST", f"/jobs/{args.id}/cancel", {})["state"])
         elif args.action == "workers":
             for worker in api("GET", "/workers"):
                 resources = worker["resources"]
@@ -77,7 +86,8 @@ def main():
                 print(f"{job['id']}  {job['state']:<9}  {' '.join(job['command'])}")
         elif args.action == "status":
             job = api("GET", f"/jobs/{args.id}")
-            for field in ("id", "state", "worker_id", "gpu_uuid", "exit_code", "error", "outputs"):
+            for field in ("id", "state", "worker_id", "gpu_uuid", "max_runtime_s",
+                          "exit_code", "error", "outputs"):
                 print(f"{field}: {job[field]}")
         elif args.action == "logs":
             after = 0
