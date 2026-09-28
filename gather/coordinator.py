@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 DB = Path(os.environ.get("GATHER_DB", "gather.db"))
 DATA = Path(os.environ.get("GATHER_DATA_DIR", "gather-data"))
-OFFLINE_AFTER = 20
+OFFLINE_AFTER = 60
 
 
 @contextmanager
@@ -206,10 +206,12 @@ def claim(worker_id: str, request: Request):
         worker = db.execute("SELECT * FROM workers WHERE id=? AND session=?", (worker_id, session)).fetchone()
         if not worker or worker["last_seen"] < time.time() - OFFLINE_AFTER:
             raise HTTPException(409, "Worker is not registered or heartbeat expired")
-        busy = db.execute("""SELECT 1 FROM jobs WHERE worker_id=?
+        busy = db.execute("""SELECT * FROM jobs WHERE worker_id=?
             AND state IN ('assigned','running')""", (worker_id,)).fetchone()
         if busy:
-            return {"job": None}
+            # A lost claim response must not strand an assigned job.
+            return {"job": row_job(busy) if busy["state"] == "assigned" and
+                    busy["worker_session"] == session else None}
         resources = json.loads(worker["resources"])
         for candidate in db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created, id"):
             if candidate["cpu"] > resources.get("cpu", 0) or candidate["ram_mb"] > resources.get("ram_mb", 0):

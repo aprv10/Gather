@@ -9,7 +9,7 @@ as its own OS user, sends logs to the coordinator, and uploads declared output f
 ## Stage 1 concepts
 
 - **Heartbeat:** A worker refreshes its resource report every five seconds. After
-  20 seconds without a heartbeat, its running job becomes `lost`.
+  60 seconds without a heartbeat, its running job becomes `lost`.
 - **Claim:** The coordinator assigns a job in one SQLite transaction so two workers
   cannot claim it. Jobs move through `queued`, `assigned`, `running`, then
   `succeeded`, `failed`, or `lost`.

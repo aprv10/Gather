@@ -44,7 +44,16 @@ def run_job(job, state_dir, server, token, worker_id, session):
     workspace = state_dir / "jobs" / job_id
     workspace.mkdir(parents=True, exist_ok=True)
     headers = {"X-Worker-Id": worker_id, "X-Worker-Session": session}
-    call("POST", f"/jobs/{job_id}/start", {}, url=server, token=token, headers=headers)
+    while True:
+        try:
+            call("POST", f"/jobs/{job_id}/start", {}, url=server, token=token, headers=headers)
+            break
+        except RuntimeError as exc:
+            if "HTTP 409" in str(exc):
+                print(f"{job_id}: assignment expired before start", flush=True)
+                return
+            print(f"{job_id}: waiting to start: {exc}", flush=True)
+            time.sleep(5)
     env = os.environ.copy()
     if job["gpu_uuid"]:
         env["CUDA_VISIBLE_DEVICES"] = job["gpu_uuid"]
