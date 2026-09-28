@@ -6,7 +6,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-def call(method, path, data=None, *, url=None, token=None, raw=False, headers=None):
+def call(method, path, data=None, *, url=None, token=None, raw=False, headers=None, timeout=15):
     base = (url or os.environ.get("GATHER_URL", "http://127.0.0.1:8000")).rstrip("/")
     secret = token or os.environ.get("GATHER_TOKEN")
     if not secret:
@@ -19,10 +19,12 @@ def call(method, path, data=None, *, url=None, token=None, raw=False, headers=No
     for key, value in (headers or {}).items():
         request.add_header(key, value)
     try:
-        with urlopen(request, timeout=15) as response:
+        with urlopen(request, timeout=timeout) as response:
             content = response.read()
             return content if raw else json.loads(content)
     except HTTPError as exc:
         raise RuntimeError(f"HTTP {exc.code}: {exc.read().decode(errors='replace')}") from exc
     except URLError as exc:
         raise RuntimeError(f"Coordinator unavailable: {exc.reason}") from exc
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Coordinator request failed: {exc}") from exc

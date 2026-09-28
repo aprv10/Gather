@@ -15,6 +15,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from gather.bundle import MAX_ARCHIVE, validate_bundle
+
 
 DB = Path(os.environ.get("GATHER_DB", "gather.db"))
 DATA = Path(os.environ.get("GATHER_DATA_DIR", "gather-data"))
@@ -43,7 +45,8 @@ def initialize():
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, command TEXT NOT NULL, cpu INTEGER NOT NULL,
                 ram_mb INTEGER NOT NULL, gpu_mb INTEGER NOT NULL,
-                outputs TEXT NOT NULL, state TEXT NOT NULL, worker_id TEXT,
+                outputs TEXT NOT NULL, has_input INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL, worker_id TEXT,
                 worker_session TEXT, gpu_uuid TEXT, exit_code INTEGER,
                 error TEXT, created REAL NOT NULL, updated REAL NOT NULL
             );
@@ -53,6 +56,8 @@ def initialize():
             );
             CREATE INDEX IF NOT EXISTS logs_job ON logs(job_id, seq);
         """)
+        if "has_input" not in {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}:
+            db.execute("ALTER TABLE jobs ADD COLUMN has_input INTEGER NOT NULL DEFAULT 0")
     DATA.mkdir(parents=True, exist_ok=True)
 
 
@@ -76,6 +81,7 @@ def row_job(row):
     result = dict(row)
     result["command"] = json.loads(result["command"])
     result["outputs"] = json.loads(result["outputs"])
+    result["has_input"] = bool(result["has_input"])
     return result
 
 
@@ -117,6 +123,11 @@ async def lifespan(_app):
 app = FastAPI(title="Gather", lifespan=lifespan)
 
 
+@app.get("/capabilities", dependencies=[Depends(authenticate)])
+def capabilities():
+    return {"input_bundle": True}
+
+
 class Registration(BaseModel):
     id: str
     name: str
@@ -130,6 +141,7 @@ class JobSpec(BaseModel):
     ram_mb: int = Field(default=0, ge=0)
     gpu_mb: int = Field(default=1, ge=0)
     outputs: list[str] = Field(default_factory=list)
+    has_input: bool = False
 
 
 @app.post("/workers/register", dependencies=[Depends(authenticate)])
@@ -175,11 +187,60 @@ def submit(spec: JobSpec):
     now = time.time()
     with connection() as db:
         db.execute("""INSERT INTO jobs
-            (id,command,cpu,ram_mb,gpu_mb,outputs,state,created,updated)
-            VALUES (?,?,?,?,?,?, 'queued',?,?)""",
+            (id,command,cpu,ram_mb,gpu_mb,outputs,has_input,state,created,updated)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (job_id, json.dumps(spec.command), spec.cpu, spec.ram_mb, spec.gpu_mb,
-             json.dumps(spec.outputs), now, now))
-    return {"id": job_id, "state": "queued"}
+             json.dumps(spec.outputs), int(spec.has_input),
+             "uploading" if spec.has_input else "queued", now, now))
+    return {"id": job_id, "state": "uploading" if spec.has_input else "queued"}
+
+
+@app.put("/jobs/{job_id}/input", dependencies=[Depends(authenticate)])
+async def upload_input(job_id: str, request: Request):
+    with connection() as db:
+        current = db.execute("SELECT has_input,state FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not current or not current["has_input"]:
+        raise HTTPException(404, "Input job not found")
+    destination = DATA / job_id / "input.zip"
+    if current["state"] == "queued" and destination.is_file():
+        return {"ok": True}
+    if current["state"] != "uploading":
+        raise HTTPException(409, "Input can no longer be uploaded")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(uuid.uuid4().hex + ".tmp")
+    size = 0
+    try:
+        with temporary.open("wb") as output:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_ARCHIVE:
+                    raise HTTPException(413, "Input ZIP exceeds 50 MiB")
+                output.write(chunk)
+        try:
+            validate_bundle(temporary)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        with connection() as db:
+            current = db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not current or current["state"] != "uploading":
+                raise HTTPException(409, "Input can no longer be uploaded")
+            os.replace(temporary, destination)
+            db.execute("UPDATE jobs SET state='queued', updated=? WHERE id=?", (time.time(), job_id))
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.get("/jobs/{job_id}/input", dependencies=[Depends(authenticate)])
+def download_input(job_id: str):
+    with connection() as db:
+        current = db.execute("SELECT has_input,state FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not current or not current["has_input"] or current["state"] == "uploading":
+        raise HTTPException(404, "Input not ready")
+    path = DATA / job_id / "input.zip"
+    if not path.is_file():
+        raise HTTPException(404, "Input file missing")
+    return FileResponse(path)
 
 
 @app.get("/jobs", dependencies=[Depends(authenticate)])
@@ -214,6 +275,8 @@ def claim(worker_id: str, request: Request):
                     busy["worker_session"] == session else None}
         resources = json.loads(worker["resources"])
         for candidate in db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created, id"):
+            if candidate["has_input"] and resources.get("protocol", 1) < 2:
+                continue
             if candidate["cpu"] > resources.get("cpu", 0) or candidate["ram_mb"] > resources.get("ram_mb", 0):
                 continue
             gpu = None

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+from gather.bundle import pack_directory
 from gather.http import call
 
 
@@ -22,7 +23,11 @@ def main():
     submit.add_argument("--ram-mb", type=int, default=0)
     submit.add_argument("--gpu-mb", type=int, default=1, help="Minimum free GPU memory; 0 for CPU only")
     submit.add_argument("--output", action="append", default=[], help="Relative output file to retrieve")
+    submit.add_argument("--input", type=Path, help="Small directory to copy into the job workspace")
     submit.add_argument("command", nargs=argparse.REMAINDER)
+    upload = commands.add_parser("upload", help="Resume an interrupted input upload")
+    upload.add_argument("id")
+    upload.add_argument("directory", type=Path)
     commands.add_parser("workers")
     commands.add_parser("jobs")
     status = commands.add_parser("status")
@@ -43,10 +48,23 @@ def main():
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not command:
                 parser.error("submit needs a command after --")
+            archive = pack_directory(args.input) if args.input else None
+            if archive is not None and not api("GET", "/capabilities").get("input_bundle"):
+                raise RuntimeError("Coordinator does not support input bundles")
             job = api("POST", "/jobs", {"command": command, "cpu": args.cpu,
                                         "ram_mb": args.ram_mb, "gpu_mb": args.gpu_mb,
-                                        "outputs": args.output})
+                                        "outputs": args.output, "has_input": archive is not None})
+            if archive is not None:
+                try:
+                    api("PUT", f"/jobs/{job['id']}/input", archive, raw=True, timeout=300)
+                except RuntimeError as exc:
+                    raise RuntimeError(f"Job {job['id']} is waiting for input; retry with "
+                                       f"gather upload {job['id']} DIRECTORY: {exc}") from exc
             print(job["id"])
+        elif args.action == "upload":
+            archive = pack_directory(args.directory)
+            api("PUT", f"/jobs/{args.id}/input", archive, raw=True, timeout=300)
+            print(args.id)
         elif args.action == "workers":
             for worker in api("GET", "/workers"):
                 resources = worker["resources"]
@@ -74,12 +92,13 @@ def main():
         elif args.action == "results":
             job = api("GET", f"/jobs/{args.id}")
             for name in job["outputs"]:
-                content = api("GET", f"/jobs/{args.id}/output/{quote(name, safe='/')}", raw=True)
+                content = api("GET", f"/jobs/{args.id}/output/{quote(name, safe='/')}",
+                              raw=True, timeout=300)
                 destination = args.dir / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(content)
                 print(destination)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError, OSError) as exc:
         print(exc, file=sys.stderr)
         raise SystemExit(1) from exc
 

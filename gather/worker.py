@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import psutil
 
+from gather.bundle import extract_bundle
 from gather.http import call
 
 
@@ -35,7 +36,8 @@ def discover():
                     continue
     except (OSError, subprocess.SubprocessError):
         pass
-    return {"cpu": os.cpu_count() or 1, "ram_mb": psutil.virtual_memory().available // (1024 * 1024),
+    return {"protocol": 2, "cpu": os.cpu_count() or 1,
+            "ram_mb": psutil.virtual_memory().available // (1024 * 1024),
             "gpus": gpus, "platform": platform.system()}
 
 
@@ -63,6 +65,10 @@ def run_job(job, state_dir, server, token, worker_id, session):
     error = None
     process = None
     try:
+        if job.get("has_input"):
+            archive = call("GET", f"/jobs/{job_id}/input", url=server, token=token,
+                           raw=True, timeout=300)
+            extract_bundle(archive, workspace)
         process = subprocess.Popen(job["command"], cwd=workspace, env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    bufsize=0)
@@ -74,7 +80,7 @@ def run_job(job, state_dir, server, token, worker_id, session):
                     call("POST", f"/jobs/{job_id}/logs", chunk,
                          url=server, token=token, raw=True, headers=headers)
         exit_code = process.wait()
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         error = str(exc)
         if process and process.poll() is None:
             process.kill()
@@ -91,7 +97,7 @@ def run_job(job, state_dir, server, token, worker_id, session):
                 if path.stat().st_size > 100 * 1024 * 1024:
                     raise RuntimeError(f"Output {name} exceeds 100 MiB")
                 call("PUT", f"/jobs/{job_id}/output/{quote(name, safe='/')}", path.read_bytes(),
-                     url=server, token=token, raw=True, headers=headers)
+                     url=server, token=token, raw=True, headers=headers, timeout=300)
             except (OSError, RuntimeError) as exc:
                 error = str(exc)
                 exit_code = 1
